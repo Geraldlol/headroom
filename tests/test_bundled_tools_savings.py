@@ -36,6 +36,15 @@ from headroom import binaries  # noqa: E402  (must follow .env-overrides setup)
 # ---------- Fixtures ------------------------------------------------------ #
 
 
+@pytest.fixture(autouse=True)
+def _allow_unpinned_binaries(monkeypatch):
+    """PEERSTAR HARDENING: this fork refuses unpinned (sha256=null) binaries by
+    default. These integration tests fetch difft/scc from upstream GitHub
+    releases, which are still unpinned in the registry, so opt into the override.
+    """
+    monkeypatch.setenv("HEADROOM_ALLOW_UNPINNED_BINARIES", "1")
+
+
 ENC = tiktoken.get_encoding("cl100k_base")
 
 
