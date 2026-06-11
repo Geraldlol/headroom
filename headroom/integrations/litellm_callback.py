@@ -15,13 +15,22 @@ Cloud mode requires httpx: pip install httpx
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CLOUD_URL = "https://api.headroomlabs.ai"
+
+# PEERSTAR HARDENING: cloud compression mode is disabled in this fork. Cloud
+# mode POSTs raw prompt content (PHI in our environment) to api.headroomlabs.ai,
+# a third party with no Peerstar BAA. Refuse cloud mode to prevent PHI egress.
+_CLOUD_DISABLED_MSG = (
+    "Headroom cloud compression is disabled in this hardened fork. Cloud mode "
+    "uploads raw prompt content to api.headroomlabs.ai (no Peerstar BAA) and is "
+    "blocked to prevent PHI egress. Unset HEADROOM_API_KEY and use the default "
+    "local compression instead."
+)
 
 
 class HeadroomCallback:
@@ -61,14 +70,15 @@ class HeadroomCallback:
         self._hooks = hooks
         self._total_saved = 0
 
-        # Cloud mode: if api_key is set, compress via Headroom Cloud API
-        # Falls back to HEADROOM_API_KEY env var
+        # PEERSTAR HARDENING: refuse to enter cloud mode. If an api_key is
+        # supplied (directly or via HEADROOM_API_KEY), fail loudly rather than
+        # silently uploading prompts to api.headroomlabs.ai.
         import os
 
-        self._api_key = api_key or os.environ.get("HEADROOM_API_KEY", "").strip() or None
-        self._api_url = (
-            api_url or os.environ.get("HEADROOM_API_URL", "").strip() or _DEFAULT_CLOUD_URL
-        ).rstrip("/")
+        if api_key or os.environ.get("HEADROOM_API_KEY", "").strip():
+            raise RuntimeError(_CLOUD_DISABLED_MSG)
+        self._api_key = None
+        self._api_url = _DEFAULT_CLOUD_URL
         self._client: Any = None  # Lazy-initialized httpx.AsyncClient
 
     @property
@@ -78,8 +88,8 @@ class HeadroomCallback:
 
     @property
     def cloud_mode(self) -> bool:
-        """Whether cloud compression is enabled."""
-        return self._api_key is not None
+        """Cloud compression is permanently disabled in this fork."""
+        return False
 
     async def async_pre_call_hook(
         self,
@@ -140,39 +150,13 @@ class HeadroomCallback:
         }
 
     async def _cloud_compress(self, messages: list[dict], model: str) -> dict[str, Any] | None:
-        """Compress via Headroom Cloud API (managed CCR, TOIN, analytics)."""
-        if self._client is None:
-            try:
-                import httpx
-            except ImportError as e:
-                raise ImportError(
-                    "httpx is required for Headroom Cloud mode: pip install httpx"
-                ) from e
-            self._client = httpx.AsyncClient(timeout=30.0)
+        """Disabled in this fork — cloud compression would upload raw prompts.
 
-        client = self._client
-        assert client is not None
-        resp = await client.post(
-            f"{self._api_url}/v1/saas/compress",
-            headers={
-                "X-Headroom-Key": self._api_key,
-                "Content-Type": "application/json",
-            },
-            content=json.dumps(
-                {
-                    "messages": messages,
-                    "model": model or "claude-sonnet-4-5-20250929",
-                    "model_limit": self._model_limit,
-                }
-            ),
-        )
-
-        if resp.status_code != 200:
-            logger.warning("Headroom Cloud API error: %d %s", resp.status_code, resp.text[:200])
-            return None
-
-        result: dict[str, Any] = resp.json()
-        return result
+        PEERSTAR HARDENING: the original implementation POSTed message content
+        to ``{cloud}/v1/saas/compress``. That path is removed so PHI can never
+        leave the machine; ``__init__`` also refuses to construct in cloud mode.
+        """
+        raise RuntimeError(_CLOUD_DISABLED_MSG)
 
     async def async_success_handler(
         self, kwargs: dict, response: Any, start_time: Any, end_time: Any

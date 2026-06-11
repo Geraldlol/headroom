@@ -26,6 +26,11 @@ def _clear_caches(monkeypatch, tmp_path):
     monkeypatch.setenv("HEADROOM_BINARIES_CACHE", str(tmp_path / "cache"))
     monkeypatch.delenv("HEADROOM_BINARIES_MIRROR", raising=False)
     monkeypatch.delenv("HEADROOM_BINARIES_OFFLINE", raising=False)
+    # PEERSTAR HARDENING: this fork refuses unpinned (sha256=null) binaries by
+    # default. These tests exercise the fetch/extract/cache machinery using
+    # intentionally unpinned mock assets, so opt into the override here. The
+    # default-deny behavior is covered by test_unpinned_binary_refused_by_default.
+    monkeypatch.setenv("HEADROOM_ALLOW_UNPINNED_BINARIES", "1")
     yield
     binaries.detect_platform.cache_clear()
     binaries._registry.cache_clear()
@@ -289,6 +294,19 @@ def test_sha256_match_passes(monkeypatch, fake_urlopen):
         assert path.read_bytes() == b"hello"
     finally:
         asset["sha256"] = None
+
+
+def test_unpinned_binary_refused_by_default(monkeypatch, fake_urlopen):
+    """PEERSTAR HARDENING: an unpinned (sha256=null) asset is refused unless
+    HEADROOM_ALLOW_UNPINNED_BINARIES is set."""
+    monkeypatch.delenv("HEADROOM_ALLOW_UNPINNED_BINARIES", raising=False)
+    _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
+    monkeypatch.setattr(binaries.shutil, "which", lambda _name: None)
+    asset = binaries._registry()["tools"]["difft"]["assets"]["darwin-aarch64"]
+    assert asset["sha256"] is None  # registry ships unpinned
+    fake_urlopen[asset["url"]] = _make_tar_gz({"difft": b"x"})
+    with pytest.raises(binaries.Sha256Mismatch):
+        binaries.resolve("difft")
 
 
 # -------- status() ------------------------------------------------------- #
