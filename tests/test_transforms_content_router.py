@@ -55,6 +55,64 @@ def test_compression_cache_handles_hits_skips_evictions_and_clear(
     assert cache.skip_size == 0
 
 
+def test_compression_cache_evicts_results_by_lru(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(content_router_module.time, "time", lambda: 100.0)
+    monkeypatch.setattr(content_router_module.time, "perf_counter_ns", lambda: 50)
+
+    cache = CompressionCache(ttl_seconds=10, max_entries=2)
+    cache.put(1, "one", 0.5, "text")
+    cache.put(2, "two", 0.5, "text")
+
+    assert cache.get(1) == ("one", 0.5, "text")
+
+    cache.put(3, "three", 0.5, "text")
+
+    assert cache.get(1) == ("one", 0.5, "text")
+    assert cache.get(2) is None
+    assert cache.get(3) == ("three", 0.5, "text")
+    assert cache.size == 2
+    assert cache.stats["cache_evictions_size"] == 1
+
+
+def test_compression_cache_evicts_skip_entries_by_lru(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(content_router_module.time, "time", lambda: 100.0)
+
+    cache = CompressionCache(ttl_seconds=10, max_entries=2)
+    cache.mark_skip(1)
+    cache.mark_skip(2)
+
+    assert cache.is_skipped(1) is True
+
+    cache.mark_skip(3)
+
+    assert cache.is_skipped(1) is True
+    assert cache.is_skipped(2) is False
+    assert cache.is_skipped(3) is True
+    assert cache.skip_size == 2
+    assert cache.stats["cache_evictions_size"] == 1
+
+
+def test_compression_cache_uses_env_max_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_CACHE_MAX_ENTRIES", "2")
+    monkeypatch.setattr(content_router_module.time, "time", lambda: 100.0)
+
+    cache = CompressionCache(ttl_seconds=10)
+    cache.put(1, "one", 0.5, "text")
+    cache.put(2, "two", 0.5, "text")
+    cache.put(3, "three", 0.5, "text")
+
+    assert cache.size == 2
+    assert cache.stats["cache_max_entries"] == 2
+    assert cache.stats["cache_evictions"] == 1
+    assert cache.stats["cache_evictions_size"] == 1
+
+
 def test_router_result_helpers_and_summary() -> None:
     pure = RouterCompressionResult(
         compressed="small",
