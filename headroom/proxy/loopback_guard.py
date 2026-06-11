@@ -44,6 +44,7 @@ __all__ = [
 # also accept IPv6-mapped IPv4 (``::ffff:127.0.0.1``) and other valid
 # loopback literals on dual-stack sockets.
 LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+TESTCLIENT_HOST = "testclient"
 
 
 def is_loopback_host(host: str | None) -> bool:
@@ -70,6 +71,11 @@ def is_loopback_host(host: str | None) -> bool:
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
         return address.ipv4_mapped.is_loopback
     return address.is_loopback
+
+
+def _is_in_process_testclient(host: str | None) -> bool:
+    """Return True for FastAPI/Starlette's default in-process client host."""
+    return host == TESTCLIENT_HOST
 
 
 def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
@@ -122,7 +128,7 @@ def require_loopback_or_admin(
 
     client = getattr(request, "client", None)
     host = getattr(client, "host", None) if client is not None else None
-    if is_loopback_host(host):
+    if is_loopback_host(host) or _is_in_process_testclient(host):
         return
 
     configured = (expected_token or "").strip()

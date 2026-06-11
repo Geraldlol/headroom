@@ -40,6 +40,13 @@ def test_dashboard_remains_available_to_loopback_callers() -> None:
     assert "html" in response.text.lower()
 
 
+def test_observability_routes_accept_default_testclient() -> None:
+    with TestClient(_app()) as client:
+        response = client.get("/stats")
+
+    assert response.status_code == 200
+
+
 def test_observability_routes_are_hidden_from_external_callers_without_admin_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
