@@ -20,6 +20,7 @@ middleware) because:
 
 from __future__ import annotations
 
+import hmac
 import ipaddress
 
 try:
@@ -33,6 +34,7 @@ __all__ = [
     "LOOPBACK_HOSTS",
     "is_loopback_host",
     "require_loopback",
+    "require_loopback_or_admin",
 ]
 
 
@@ -90,3 +92,42 @@ def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
     if not is_loopback_host(host):
         # No body: minimal FastAPI default, behaves like "no route".
         raise HTTPException(status_code=404)
+
+
+def _request_admin_token(request: Request) -> str | None:  # type: ignore[valid-type]
+    headers = getattr(request, "headers", {})
+    token = headers.get("x-headroom-admin-token")
+    if token:
+        return str(token).strip()
+
+    authorization = headers.get("authorization", "")
+    scheme, _, value = str(authorization).partition(" ")
+    if scheme.lower() == "bearer" and value:
+        return str(value).strip()
+    return None
+
+
+def require_loopback_or_admin(
+    request: Request,  # type: ignore[valid-type]
+    expected_token: str | None,
+) -> None:
+    """Allow loopback callers, otherwise require the configured admin token.
+
+    This is used for dashboard/observability routes. Local use remains
+    frictionless, but non-loopback callers cannot read stats or telemetry
+    details without an explicit token.
+    """
+    if HTTPException is None:  # pragma: no cover - defensive
+        raise RuntimeError("FastAPI is required for the loopback guard")
+
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None) if client is not None else None
+    if is_loopback_host(host):
+        return
+
+    configured = (expected_token or "").strip()
+    supplied = _request_admin_token(request)
+    if configured and supplied and hmac.compare_digest(supplied, configured):
+        return
+
+    raise HTTPException(status_code=404)

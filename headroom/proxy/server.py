@@ -1703,11 +1703,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             }
         return payload
 
-    # CORS
+    # CORS. Keep wildcard origin support for browser SDK/dev use, but do not
+    # combine it with credentialed CORS.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -1851,7 +1852,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     from headroom.proxy.debug_introspection import (
         collect_tasks as _collect_tasks,
     )
-    from headroom.proxy.loopback_guard import require_loopback as _require_loopback
+    from headroom.proxy.loopback_guard import (
+        require_loopback as _require_loopback,
+    )
+    from headroom.proxy.loopback_guard import (
+        require_loopback_or_admin as _require_loopback_or_admin,
+    )
+
+    def _require_observability_access(request: Request) -> None:
+        _require_loopback_or_admin(
+            request,
+            expected_token=os.environ.get("HEADROOM_ADMIN_TOKEN"),
+        )
 
     @app.get("/debug/tasks", dependencies=[Depends(_require_loopback)])
     async def debug_tasks(stack: bool = False):
@@ -1881,7 +1893,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         payload["runtime"] = _runtime_payload()
         return JSONResponse(status_code=200, content=payload)
 
-    @app.get("/dashboard", response_class=HTMLResponse)
+    @app.get(
+        "/dashboard",
+        response_class=HTMLResponse,
+        dependencies=[Depends(_require_observability_access)],
+    )
     async def dashboard():
         """Serve the Headroom dashboard UI."""
         return get_dashboard_html()
@@ -2327,7 +2343,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _stats_snapshot["expires_at"] = time.monotonic() + DASHBOARD_STATS_CACHE_TTL_SECONDS
             return payload
 
-    @app.get("/stats")
+    @app.get("/stats", dependencies=[Depends(_require_observability_access)])
     async def stats(cached: bool = False):
         """Get comprehensive proxy statistics.
 
@@ -2359,7 +2375,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _stats_snapshot["expires_at"] = 0.0
         return JSONResponse(status_code=200, content={"status": "reset"})
 
-    @app.get("/stats-history")
+    @app.get("/stats-history", dependencies=[Depends(_require_observability_access)])
     async def stats_history(
         format: Literal["json", "csv"] = "json",
         series: Literal["history", "hourly", "daily", "weekly", "monthly"] = "history",
@@ -2376,7 +2392,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
 
-    @app.get("/transformations/feed")
+    @app.get("/transformations/feed", dependencies=[Depends(_require_observability_access)])
     async def transformations_feed(limit: int = 20):
         """Get recent message transformations for the live feed.
 
@@ -2410,7 +2426,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return {"transformations": transformations, "log_full_messages": log_full_messages}
 
-    @app.get("/subscription-window")
+    @app.get("/subscription-window", dependencies=[Depends(_require_observability_access)])
     async def subscription_window():
         """Current Anthropic subscription window utilisation and Headroom contribution.
 
@@ -2435,12 +2451,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         await tracker.maybe_poll_on_demand()
         return JSONResponse(content=tracker.render_state())
 
-    @app.get("/quota")
+    @app.get("/quota", dependencies=[Depends(_require_observability_access)])
     async def quota():
         """Unified quota/rate-limit stats for all registered providers (Anthropic, Codex, Copilot)."""
         return JSONResponse(content=get_quota_registry().get_all_stats())
 
-    @app.get("/metrics")
+    @app.get("/metrics", dependencies=[Depends(_require_observability_access)])
     async def metrics():
         """Prometheus metrics endpoint."""
         return PlainTextResponse(
@@ -2542,7 +2558,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
             )
 
-    @app.get("/v1/retrieve/stats")
+    @app.get("/v1/retrieve/stats", dependencies=[Depends(_require_observability_access)])
     async def ccr_stats():
         """Get CCR compression store statistics."""
         store = get_compression_store()
@@ -2563,7 +2579,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             ],
         }
 
-    @app.get("/v1/feedback")
+    @app.get("/v1/feedback", dependencies=[Depends(_require_observability_access)])
     async def ccr_feedback():
         """Get CCR feedback loop statistics and learned patterns.
 
@@ -2596,7 +2612,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
         }
 
-    @app.get("/v1/feedback/{tool_name}")
+    @app.get(
+        "/v1/feedback/{tool_name}",
+        dependencies=[Depends(_require_observability_access)],
+    )
     async def ccr_feedback_for_tool(tool_name: str):
         """Get compression hints for a specific tool.
 
@@ -2632,7 +2651,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         }
 
     # Telemetry endpoints (Data Flywheel)
-    @app.get("/v1/telemetry")
+    @app.get("/v1/telemetry", dependencies=[Depends(_require_observability_access)])
     async def telemetry_stats():
         """Get telemetry statistics for the data flywheel.
 
@@ -2655,7 +2674,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         telemetry = get_telemetry_collector()
         return telemetry.get_stats()
 
-    @app.get("/v1/telemetry/export")
+    @app.get("/v1/telemetry/export", dependencies=[Depends(_require_observability_access)])
     async def telemetry_export():
         """Export full telemetry data for aggregation.
 
@@ -2671,7 +2690,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         telemetry = get_telemetry_collector()
         return telemetry.export_stats()
 
-    @app.post("/v1/telemetry/import")
+    @app.post("/v1/telemetry/import", dependencies=[Depends(_require_observability_access)])
     async def telemetry_import(request: Request):
         """Import telemetry data from another source.
 
@@ -2685,7 +2704,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         telemetry.import_stats(data)
         return {"status": "imported", "current_stats": telemetry.get_stats()}
 
-    @app.get("/v1/telemetry/tools")
+    @app.get("/v1/telemetry/tools", dependencies=[Depends(_require_observability_access)])
     async def telemetry_tools():
         """Get telemetry statistics for all tracked tool signatures.
 
@@ -2701,7 +2720,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "tools": {sig_hash: stats.to_dict() for sig_hash, stats in all_stats.items()},
         }
 
-    @app.get("/v1/telemetry/tools/{signature_hash}")
+    @app.get(
+        "/v1/telemetry/tools/{signature_hash}",
+        dependencies=[Depends(_require_observability_access)],
+    )
     async def telemetry_tool_detail(signature_hash: str):
         """Get detailed telemetry for a specific tool signature.
 
@@ -2723,7 +2745,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         }
 
     # TOIN (Tool Output Intelligence Network) endpoints
-    @app.get("/v1/toin/stats")
+    @app.get("/v1/toin/stats", dependencies=[Depends(_require_observability_access)])
     async def toin_stats():
         """Get overall TOIN statistics.
 
@@ -2741,7 +2763,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         toin = get_toin()
         return toin.get_stats()
 
-    @app.get("/v1/toin/patterns")
+    @app.get("/v1/toin/patterns", dependencies=[Depends(_require_observability_access)])
     async def toin_patterns(limit: int = 20):
         """List TOIN patterns with most samples.
 
@@ -2796,7 +2818,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return patterns_list[:limit]
 
-    @app.get("/v1/toin/pattern/{hash_prefix}")
+    @app.get(
+        "/v1/toin/pattern/{hash_prefix}",
+        dependencies=[Depends(_require_observability_access)],
+    )
     async def toin_pattern_detail(hash_prefix: str):
         """Get detailed TOIN pattern info by hash prefix.
 
