@@ -3,9 +3,12 @@
 Sends aggregate-only stats (tokens saved, compression ratios, cache hit rates,
 performance overhead) to help improve Headroom.  No prompts, no content, no PII.
 
-On by default. Opt out with:
-    HEADROOM_TELEMETRY=off headroom proxy
-    headroom proxy --no-telemetry
+PEERSTAR HARDENING: the network beacon is OFF by default in this fork (upstream
+ships it on-by-default). The proxy makes NO unsolicited outbound connection to
+the Supabase endpoint unless you explicitly opt in:
+    HEADROOM_TELEMETRY_BEACON=on headroom proxy
+Local, filesystem-only stats collection (the savings dashboard) is unaffected
+and can still be disabled wholesale with HEADROOM_TELEMETRY=off.
 """
 
 from __future__ import annotations
@@ -68,10 +71,33 @@ def _build_pipeline_timing(stats: dict) -> dict[str, object]:
     return pipeline_timing
 
 
+_BEACON_ON_VALUES = frozenset(("on", "true", "1", "yes", "enable", "enabled"))
+
+
 def is_telemetry_enabled() -> bool:
-    """Check if telemetry is enabled (on by default, opt out with env var)."""
+    """Check if (local) telemetry is enabled (on by default, opt out with env var).
+
+    Governs the LOCAL, filesystem-only stats collector that powers the savings
+    dashboard. This never makes a network call. The separate Supabase phone-home
+    is gated by is_network_beacon_enabled(), which is OFF by default in this fork.
+    """
     val = os.environ.get("HEADROOM_TELEMETRY", "on").lower().strip()
     return val not in _OFF_VALUES
+
+
+def is_network_beacon_enabled() -> bool:
+    """Whether the proxy may POST aggregate stats to the third-party Supabase endpoint.
+
+    PEERSTAR HARDENING: OFF by default. Upstream sent anonymous aggregate stats
+    to api/Supabase whenever telemetry was on; in a PHI environment the proxy
+    must make no unsolicited outbound connection. Opt in explicitly with
+    HEADROOM_TELEMETRY_BEACON=on (and HEADROOM_TELEMETRY must not be off). Local
+    stats collection is unaffected either way.
+    """
+    if not is_telemetry_enabled():
+        return False
+    val = os.environ.get("HEADROOM_TELEMETRY_BEACON", "off").lower().strip()
+    return val in _BEACON_ON_VALUES
 
 
 def is_telemetry_warn_enabled() -> bool:
@@ -120,12 +146,14 @@ class TelemetryBeacon:
 
     async def start(self) -> None:
         """Start the periodic beacon. Call from proxy startup."""
-        if not is_telemetry_enabled():
-            logger.debug("Telemetry disabled (HEADROOM_TELEMETRY=off)")
+        # PEERSTAR HARDENING: the network beacon is off unless explicitly opted in.
+        if not is_network_beacon_enabled():
+            logger.debug("Network telemetry beacon disabled (set HEADROOM_TELEMETRY_BEACON=on)")
             return
         self._task = asyncio.create_task(self._loop())
         logger.info(
-            "Telemetry: ENABLED (anonymous aggregate stats, opt out: HEADROOM_TELEMETRY=off)"
+            "Telemetry beacon: ENABLED (anonymous aggregate stats, "
+            "opt out: HEADROOM_TELEMETRY_BEACON=off)"
         )
 
     async def stop(self) -> None:
@@ -137,7 +165,7 @@ class TelemetryBeacon:
         # Short-lived restarts (e.g. crash loops, orchestration churn) would
         # otherwise spam the telemetry table with duplicate cumulative stats.
         uptime_seconds = time.time() - self._start_time
-        if is_telemetry_enabled() and uptime_seconds > 120:
+        if is_network_beacon_enabled() and uptime_seconds > 120:
             await self._report()
 
     async def _loop(self) -> None:

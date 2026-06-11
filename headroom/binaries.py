@@ -271,11 +271,35 @@ def _sha256_file(path: Path) -> str:
 
 def _verify_sha256(path: Path, expected: str | None) -> None:
     if not expected:
-        # Upstream release not SHA-pinned in registry. HTTPS + the GitHub CDN
-        # is the only integrity check. Log at INFO so verbose runs can see
-        # this state; `doctor` surfaces the same fact via `sha_pinned=False`.
-        logger.info("binary %s downloaded without sha256 pin (HTTPS trust only)", path.name)
-        return
+        # PEERSTAR HARDENING: fail closed on unpinned binaries.
+        #
+        # Upstream `tools.json` ships every asset with `sha256: null`, which
+        # previously meant "HTTPS trust only" — the downloaded binary was
+        # chmod +x'd and exec'd with no integrity check. A compromised upstream
+        # release (or the GitHub mirror env var) would therefore run as code on
+        # this machine. We refuse the binary instead; callers in the
+        # compression pipeline fall back to their non-accelerated path.
+        #
+        # Escape hatch for non-regulated use: set HEADROOM_ALLOW_UNPINNED_BINARIES=1
+        # to restore the old trust-on-first-use behavior.
+        if os.environ.get("HEADROOM_ALLOW_UNPINNED_BINARIES", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            logger.warning(
+                "binary %s has no sha256 pin; executing anyway because "
+                "HEADROOM_ALLOW_UNPINNED_BINARIES is set (HTTPS trust only)",
+                path.name,
+            )
+            return
+        path.unlink(missing_ok=True)
+        raise Sha256Mismatch(
+            f"refusing to use unpinned binary {path.name}: no sha256 in registry. "
+            "Set HEADROOM_ALLOW_UNPINNED_BINARIES=1 to override (not recommended in "
+            "a PHI environment)."
+        )
     got = _sha256_file(path)
     if got.lower() != expected.lower():
         path.unlink(missing_ok=True)
