@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -189,7 +190,7 @@ def _create_content_signature(
 
 
 class CompressionCache:
-    """Two-tier compression cache with TTL.
+    """Two-tier compression cache with TTL and bounded LRU eviction.
 
     Tier 1 (skip set): content hashes that won't compress — instant skip,
     near-zero memory (just ints in a set).
@@ -197,27 +198,55 @@ class CompressionCache:
     Tier 2 (result cache): compressed results for content that DID compress —
     reuse the compressed text on subsequent requests.
 
-    Entries expire after TTL (default 30min). No max-entries cap — TTL is the
-    natural bound. Memory grows proportional to compressible content × TTL,
-    which is bounded by session duration.
+    Entries expire after TTL (default 30min), and each tier is capped by entry
+    count. Successful lookups refresh recency so active entries survive over
+    older untouched entries.
 
     Uses in-process dict for ultra-fast lookups (~100ns). Could be backed
     by memcached/Redis for multi-process deployments.
     """
 
-    def __init__(self, ttl_seconds: int = 1800):
+    DEFAULT_MAX_ENTRIES = 4096
+
+    def __init__(self, ttl_seconds: int = 1800, max_entries: int | None = None):
         # Tier 2: compressed results {hash: (text, ratio, strategy, timestamp)}
-        self._results: dict[int, tuple[str, float, str, float]] = {}
+        self._results: OrderedDict[int, tuple[str, float, str, float]] = OrderedDict()
         # Tier 1: hashes of content that won't compress {hash: timestamp}
-        self._skip: dict[int, float] = {}
+        self._skip: OrderedDict[int, float] = OrderedDict()
         self._ttl_seconds = ttl_seconds
+        self._max_entries = self._resolve_max_entries(max_entries)
         # Metrics
         self._hits = 0
         self._misses = 0
         self._skip_hits = 0
-        self._evictions = 0
+        self._evictions_ttl = 0
+        self._evictions_size = 0
         self._total_lookup_ns = 0
         self._lookup_count = 0
+
+    @classmethod
+    def _resolve_max_entries(cls, max_entries: int | None) -> int:
+        if max_entries is not None:
+            return max(1, max_entries)
+
+        raw_value = os.getenv("HEADROOM_CACHE_MAX_ENTRIES")
+        if raw_value is None:
+            return cls.DEFAULT_MAX_ENTRIES
+
+        try:
+            return max(1, int(raw_value))
+        except ValueError:
+            logger.warning(
+                "Invalid HEADROOM_CACHE_MAX_ENTRIES=%r; using default %s",
+                raw_value,
+                cls.DEFAULT_MAX_ENTRIES,
+            )
+            return cls.DEFAULT_MAX_ENTRIES
+
+    def _evict_oversize(self, entries: OrderedDict[int, Any]) -> None:
+        while len(entries) > self._max_entries:
+            entries.popitem(last=False)
+            self._evictions_size += 1
 
     def get(self, key: int) -> tuple[str, float, str] | None:
         """Get cached compression result.
@@ -230,13 +259,14 @@ class CompressionCache:
         if entry is not None:
             compressed, ratio, strategy, created_at = entry
             if (time.time() - created_at) < self._ttl_seconds:
+                self._results.move_to_end(key)
                 self._hits += 1
                 self._total_lookup_ns += time.perf_counter_ns() - t0
                 self._lookup_count += 1
                 return (compressed, ratio, strategy)
             else:
                 del self._results[key]
-                self._evictions += 1
+                self._evictions_ttl += 1
         self._misses += 1
         self._total_lookup_ns += time.perf_counter_ns() - t0
         self._lookup_count += 1
@@ -247,25 +277,32 @@ class CompressionCache:
         ts = self._skip.get(key)
         if ts is not None:
             if (time.time() - ts) < self._ttl_seconds:
+                self._skip.move_to_end(key)
                 self._skip_hits += 1
                 return True
             else:
                 del self._skip[key]
-                self._evictions += 1
+                self._evictions_ttl += 1
         return False
 
     def put(self, key: int, compressed: str, ratio: float, strategy: str) -> None:
         """Store a compressed result (Tier 2)."""
         self._results[key] = (compressed, ratio, strategy, time.time())
+        self._results.move_to_end(key)
+        self._evict_oversize(self._results)
 
     def mark_skip(self, key: int) -> None:
         """Mark content as non-compressible (Tier 1)."""
         self._skip[key] = time.time()
+        self._skip.move_to_end(key)
+        self._evict_oversize(self._skip)
 
     def move_to_skip(self, key: int) -> None:
         """Move a result to skip set (threshold tightened, no longer qualifies)."""
         self._results.pop(key, None)
         self._skip[key] = time.time()
+        self._skip.move_to_end(key)
+        self._evict_oversize(self._skip)
 
     @property
     def size(self) -> int:
@@ -282,9 +319,12 @@ class CompressionCache:
             "cache_hits": self._hits,
             "cache_skip_hits": self._skip_hits,
             "cache_misses": self._misses,
-            "cache_evictions": self._evictions,
+            "cache_evictions": self._evictions_ttl + self._evictions_size,
+            "cache_evictions_ttl": self._evictions_ttl,
+            "cache_evictions_size": self._evictions_size,
             "cache_size": len(self._results),
             "cache_skip_size": len(self._skip),
+            "cache_max_entries": self._max_entries,
             "cache_avg_lookup_ns": avg_ns,
         }
 
