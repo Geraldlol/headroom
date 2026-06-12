@@ -1,0 +1,61 @@
+name: headroom-remote-control
+
+# Two-container stack that gives Claude Code automatic compression AND a working
+# /remote-control at the same time.
+#
+#   claude  --(HTTPS_PROXY, no ANTHROPIC_BASE_URL)-->  headroom-mitm
+#       headroom-mitm intercepts ONLY api.anthropic.com (--allow-hosts);
+#       its addon redirects POST /v1/messages into headroom-proxy, which does
+#       all compression and forwards to the real API. Every other host
+#       (Remote Control relay, telemetry) is blind-tunnelled untouched.
+#
+# headroom-proxy is the EXISTING hardened image, unchanged. The novel part is
+# reaching it via a forward proxy (HTTPS_PROXY) instead of ANTHROPIC_BASE_URL,
+# which is what keeps Remote Control's "no base-URL override" guard happy.
+
+services:
+  headroom-proxy:
+    image: headroom-hardened:local
+    restart: unless-stopped
+    environment:
+      HEADROOM_BINARIES_OFFLINE: "1"
+      ANTHROPIC_TARGET_API_URL: ${ANTHROPIC_TARGET_API_URL:-https://api.anthropic.com}
+    # Same flags the standalone hardened proxy runs with (peerstar/install.ps1).
+    # It forwards the client's inbound Authorization header, so subscription
+    # billing is preserved; no API key is set here.
+    command: ["--host", "0.0.0.0", "--port", "8787", "--backend", "anthropic", "--no-telemetry"]
+    expose:
+      - "8787"
+
+  headroom-mitm:
+    image: mitmproxy/mitmproxy:12
+    restart: unless-stopped
+    depends_on:
+      - headroom-proxy
+    command:
+      - mitmdump
+      - --mode
+      - regular
+      - --listen-host
+      - 0.0.0.0
+      - --listen-port
+      - "8080"
+      # Only intercept the Anthropic API host; tunnel everything else (incl.
+      # Remote Control) untouched. (:443)? guards a known host:port match bug.
+      - --allow-hosts
+      - '^api\.anthropic\.com(:443)?$$'
+      - -s
+      - /addon/redirect_addon.py
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Mount the named volume at mitmproxy's DEFAULT confdir. The image
+      # entrypoint aligns the dropped 'mitmproxy' user's uid to this dir's
+      # owner, so it can write the generated CA there. The installer copies
+      # mitmproxy-ca-cert.pem out to the host for NODE_EXTRA_CA_CERTS.
+      - headroom_mitm_ca:/home/mitmproxy/.mitmproxy
+      # Addon mounted read-only (directory mount, robust on Docker Desktop).
+      - ./:/addon:ro
+
+volumes:
+  headroom_mitm_ca:
